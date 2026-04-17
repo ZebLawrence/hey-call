@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Call artifacts — stay local, never commit
+calls/**
+!calls/.gitkeep
