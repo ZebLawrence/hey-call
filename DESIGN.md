@@ -4,6 +4,20 @@
 **Status:** Draft — pending implementation  
 **Strategy:** ElevenLabs Conversational AI + Twilio  
 
+### API Documentation Links
+
+| Service | Resource | URL |
+|---------|----------|-----|
+| ElevenLabs | Outbound Call API | https://elevenlabs.io/docs/api-reference/conversational-ai/twilio-outbound-call |
+| ElevenLabs | Get Conversation | https://elevenlabs.io/docs/api-reference/conversational-ai/get-conversation |
+| ElevenLabs | Get Conversation Audio | https://elevenlabs.io/docs/api-reference/conversational-ai/get-conversation-audio |
+| ElevenLabs | Create Phone Number (Twilio Import) | https://elevenlabs.io/docs/api-reference/conversational-ai/create-phone-number |
+| ElevenLabs | Twilio Native Integration Guide | https://elevenlabs.io/docs/eleven-agents/phone-numbers/twilio-integration/native-integration |
+| Twilio | Phone Number Pricing | https://help.twilio.com/articles/223182908-How-much-does-a-phone-number-cost- |
+| Twilio | Voice Pricing (US) | https://www.twilio.com/en-us/voice/pricing/us |
+| Twilio | Buy a Phone Number | https://help.twilio.com/articles/223135247-How-to-Search-for-and-Buy-a-Twilio-Phone-Number-from-Console |
+| Twilio | Account SID & Auth Token | https://help.twilio.com/articles/14726256820123-What-is-a-Twilio-Account-SID-and-where-can-I-find-it- |
+
 ---
 
 ## Overview
@@ -36,8 +50,8 @@ Mac: [runs call.py] → call happens → reports summary back
 │  2. Call ElevenLabs API → initiate outbound call    │
 │  3. Poll for completion                             │
 │  4. Fetch transcript + recording                    │
-│  5. Generate summary via Claude API                 │
-│  6. Save artifacts + print summary to stdout        │
+│  5. Save artifacts + print transcript to stdout     │
+│  6. Mac (Claude Code) analyzes in-session           │
 └──────────┬──────────────────────┬────────────────────┘
            │                      │
            ▼                      ▼
@@ -69,7 +83,7 @@ Mac: [runs call.py] → call happens → reports summary back
 |------|---------|
 | `call.py` | Main CLI entry point |
 | `elevenlabs_client.py` | ElevenLabs API wrapper (initiate, poll, fetch) |
-| `report.py` | Transcript → summary via Claude API |
+| `report.py` | Transcript formatting + artifact saving |
 | `config.py` | Env var loading + validation |
 | `prompts/agent_system.txt` | Base system prompt template for the caller agent |
 | `requirements.txt` | Python dependencies |
@@ -107,30 +121,38 @@ workspace/calls/
    │   → call_recording_enabled: true
    │   → conversation_initiation_client_data:
    │       conversation_config_override:
-   │         prompt: { prompt: <system prompt with goal> }
-   │         first_message: "Hi, this is Mac calling on behalf of Zeb..."
+   │         agent:
+   │           prompt: { prompt: <system prompt with goal> }
+   │           first_message: "Hi, this is Mac calling on behalf of Zeb..."
    │   ← { success, conversation_id, callSid }
    │
-4. Poll GET /v1/convai/conversations/{id} every 5s
+   │   Docs: https://elevenlabs.io/docs/api-reference/conversational-ai/twilio-outbound-call
+   │
+4. Poll GET /v1/convai/conversations/{id} with backoff
    │   → status: "initiated" | "in-progress" | "processing" | "done" | "failed"
-   │   → timeout: 10 minutes
+   │   → poll every 5s for the first 2 min, then every 10s
+   │   → timeout: 15 minutes
+   │   → transcript entries may have null `message` field — skip those
+   │   Docs: https://elevenlabs.io/docs/api-reference/conversational-ai/get-conversation
    │
 5. On "done":
    │   transcript is in the GET response body (.transcript array)
+   │   check response `has_audio` field before fetching
    │   GET /v1/convai/conversations/{id}/audio    → recording.mp3
+   │   Docs: https://elevenlabs.io/docs/api-reference/conversational-ai/get-conversation-audio
    │
-6. report.py sends transcript to Claude API
-   │   → Returns structured summary markdown
+6. Save all artifacts to workspace/calls/<dir>/
+   │   Print formatted transcript to stdout
    │
-7. Print summary to stdout (Mac reads this)
-   Save all artifacts to workspace/calls/<dir>/
+7. Mac (Claude Code) reads the output and generates
+   a structured summary in-session — no separate API call
 ```
 
 ---
 
 ## ElevenLabs Agent Configuration
 
-One persistent agent is pre-configured in the ElevenLabs dashboard. Per-call customization happens via `conversation_initiation_client_data.conversation_config_override` in the API call (so we don't create a new agent per call).
+One persistent agent is pre-configured in the ElevenLabs dashboard. Per-call customization happens via `conversation_initiation_client_data.conversation_config_override.agent` in the API call (so we don't create a new agent per call). See [ElevenLabs Outbound Call API](https://elevenlabs.io/docs/api-reference/conversational-ai/twilio-outbound-call) for the full schema.
 
 **Agent settings:**
 
@@ -150,15 +172,9 @@ One persistent agent is pre-configured in the ElevenLabs dashboard. Per-call cus
 
 ## Summary Generation
 
-`report.py` sends the completed transcript to Claude (claude-sonnet-4-6) with this prompt:
+Summary generation happens **in the Claude Code session**, not via a separate API call. After `call.py` prints the transcript to stdout, Mac reads it and produces a structured analysis:
 
 ```
-You are Mac, analyzing a phone call you just completed on Zeb's behalf.
-Call goal: <GOAL>
-Target: <NUMBER>
-
-Analyze the transcript and produce a structured report:
-
 ## Call Outcome
 [achieved / partially achieved / not achieved / no answer / voicemail]
 
@@ -175,7 +191,7 @@ Analyze the transcript and produce a structured report:
 [2-3 sentence narrative of how the call went]
 ```
 
-The summary is printed to stdout and saved to `summary.md`.
+Mac saves this summary to `summary.md` in the call's artifact directory. This approach has zero additional API cost and leverages the existing Claude Code session context.
 
 ---
 
@@ -185,32 +201,39 @@ The summary is printed to stdout and saved to `summary.md`.
 ELEVENLABS_API_KEY=...          # ElevenLabs account API key
 ELEVENLABS_AGENT_ID=...         # ID of the pre-configured EL agent
 ELEVENLABS_PHONE_NUMBER_ID=...  # ID of the Twilio DID registered in EL
-ANTHROPIC_API_KEY=...           # For summary generation
 ```
 
-Twilio credentials are not needed in the Python code — they're configured inside ElevenLabs when you import the phone number.
+Twilio credentials are not needed in the Python code — they're configured inside ElevenLabs when you import the phone number. No Anthropic API key is needed — summary generation happens in the Claude Code session.
 
 ---
+
+## Input Validation
+
+Phone numbers must be E.164 format (`+` followed by 10-15 digits, e.g. `+13035551234`). `call.py` validates this before making any API calls and exits with a clear error if the format is wrong.
 
 ## Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
+| Invalid phone number | Reject before API call with format guidance. |
 | No answer | Poll returns `done` with empty transcript. Summary: "No answer." |
-| Voicemail | Agent detects voicemail, ends call. Transcript saved. Summary flags it. |
-| Busy / failed | API returns error status. Log to `error.log`, report to Zeb. |
-| Timeout (>10 min) | Script terminates, saves partial transcript, reports timeout. |
+| Voicemail | Agent follows voicemail instructions in system prompt (leave brief message, end call). Transcript saved. Summary flags it. |
+| Busy / failed | API returns `failed` status. Save whatever metadata exists, report to Zeb. |
+| Timeout (>15 min) | Script terminates, attempts to fetch partial transcript if available, reports timeout. |
+| No audio available | Check `has_audio` field from conversation response. Skip audio fetch if false. |
+| Null transcript messages | Filter out transcript entries with null `message` field during formatting. |
 | API error | Retry once, then fail with clear error message. |
 
 ---
 
 ## Setup Checklist (One-Time)
 
-- [ ] Create ElevenLabs account, get API key
-- [ ] Buy a Twilio phone number (~$1.15/month)
-- [ ] Import Twilio number into ElevenLabs (Settings → Phone Numbers → Import)
-- [ ] Create the EL agent (Conversational AI → New Agent), note the agent ID
-- [ ] Set env vars (can live in `workspace/phone-agent/.env`, gitignored)
+- [ ] Create [ElevenLabs](https://elevenlabs.io) account → Settings → API Keys → copy key
+- [ ] Buy a Twilio phone number (~$1.15/month) — [Console → Develop → Phone Numbers → Buy a Number](https://console.twilio.com/us1/develop/phone-numbers/manage/search) ([guide](https://help.twilio.com/articles/223135247-How-to-Search-for-and-Buy-a-Twilio-Phone-Number-from-Console))
+- [ ] Get Twilio Account SID + Auth Token from [Console Dashboard](https://console.twilio.com/) → Account Info ([guide](https://help.twilio.com/articles/14726256820123-What-is-a-Twilio-Account-SID-and-where-can-I-find-it-))
+- [ ] Import Twilio number into ElevenLabs — [Conversational AI → Phone Numbers → Add → Import from Twilio](https://elevenlabs.io/docs/eleven-agents/phone-numbers/twilio-integration/native-integration) ([API](https://elevenlabs.io/docs/api-reference/conversational-ai/create-phone-number))
+- [ ] Create EL agent (Conversational AI → Create Agent), note the agent ID
+- [ ] Set env vars (copy `.env.example` to `.env`, fill in keys)
 - [ ] `pip install -r requirements.txt`
 - [ ] Test call: `python call.py "+1XXXXXXXXXX" "ask if they are open on weekends"`
 
@@ -218,22 +241,21 @@ Twilio credentials are not needed in the Python code — they're configured insi
 
 ## Cost Model
 
-| Component | Rate | 5-min call |
-|-----------|------|-----------|
-| ElevenLabs Conversational AI | ~$0.08/min | $0.40 |
-| Twilio outbound (US) | ~$0.013/min | $0.065 |
-| Claude summary (claude-sonnet-4-6) | ~$0.003/call | $0.003 |
-| Twilio DID number | $1.15/month | — |
-| **Total per call** | | **~$0.47** |
+| Component | Rate | 5-min call | Source |
+|-----------|------|-----------|--------|
+| ElevenLabs Conversational AI | ~$0.08/min | $0.40 | [EL Pricing](https://elevenlabs.io/pricing) |
+| Twilio outbound (US) | ~$0.014/min | $0.07 | [Twilio Voice Pricing](https://www.twilio.com/en-us/voice/pricing/us) |
+| Summary generation | $0 | $0 | Done in-session by Claude Code (Mac) |
+| Twilio DID number | $1.15/month | — | [Twilio Number Pricing](https://help.twilio.com/articles/223182908-How-much-does-a-phone-number-cost-) |
+| **Total per call** | | **~$0.47** | |
 
 At 10 calls/day: ~$4.70/day, ~$141/month + $1.15 DID = **~$142/month**.  
-At 1-2 calls/day (expected): **~$15-30/month**.
+At 1-2 calls/day (expected): **~$15-29/month**.
 
 ---
 
 ## Future Extensions
 
-- **Voicemail detection + message**: If voicemail detected, leave a scripted message and end.
 - **IVR navigation**: ElevenLabs agents can navigate "press 1 for sales" menus automatically.
 - **Callback scheduling**: If nobody answers, re-queue for a different time.
 - **Custom caller ID**: With Twilio, can set a display name (e.g., "Zeb Lawrence Consulting").

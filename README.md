@@ -8,20 +8,20 @@ AI phone agent that makes outbound calls on your behalf. Give it a number and a 
 You: "call +13035551234, goal: find out if the owner would consider selling"
 hey-call: [initiates call via ElevenLabs + Twilio]
            [waits for call to complete]
-           [generates summary via Claude]
-           [reports back + saves artifacts]
+           [saves transcript + recording]
+           [Mac analyzes transcript in-session]
 ```
 
-**Stack:** ElevenLabs Conversational AI (STT + LLM + TTS) · Twilio (phone number) · Claude Sonnet (summary)  
-**Cost:** ~$0.47 per 5-minute call
+**Stack:** ElevenLabs Conversational AI (STT + LLM + TTS) · Twilio (phone number) · Claude Code (summary, in-session)  
+**Cost:** ~$0.47 per 5-minute call (no extra API costs — summary runs in your Claude Code session)
 
 ## Setup
 
 ### 1. Accounts required
 
-- [ElevenLabs](https://elevenlabs.io) — create a Conversational AI agent, note the agent ID
-- [Twilio](https://twilio.com) — buy a US phone number (~$1.15/month), import it into ElevenLabs
-- [Anthropic](https://console.anthropic.com) — API key for summary generation
+- [ElevenLabs](https://elevenlabs.io) — create a Conversational AI agent, note the agent ID ([API docs](https://elevenlabs.io/docs/api-reference/conversational-ai/twilio-outbound-call))
+- [Twilio](https://twilio.com) — buy a US phone number (~$1.15/month), import it into ElevenLabs ([guide](https://elevenlabs.io/docs/eleven-agents/phone-numbers/twilio-integration/native-integration))
+- [Claude Code](https://claude.com/claude-code) — summary generation happens in-session (no separate API key needed)
 
 ### 2. ElevenLabs agent configuration
 
@@ -59,11 +59,10 @@ calls/
 └── 2026-04-17_14-32_1234/
     ├── transcript.json   # raw ElevenLabs API response
     ├── transcript.txt    # human-readable turn-by-turn
-    ├── recording.mp3     # full call audio
-    └── summary.md        # Claude-generated analysis
+    └── recording.mp3     # full call audio (if available)
 ```
 
-The summary is also printed to stdout immediately after the call.
+The transcript is printed to stdout. Mac (Claude Code) reads it and generates a summary in-session, then saves `summary.md` to the call directory.
 
 ## Docs
 
@@ -76,6 +75,8 @@ The summary is also printed to stdout immediately after the call.
 | Component | Rate | 5-min call |
 |-----------|------|-----------|
 | ElevenLabs Conversational AI | ~$0.08/min | $0.40 |
-| Twilio outbound (US) | ~$0.013/min | $0.07 |
-| Claude summary | ~$0.003/call | $0.003 |
+| Twilio outbound (US) | ~$0.014/min | $0.07 |
+| Summary generation | $0 | $0 (in-session) |
 | **Total** | | **~$0.47** |
+
+See [DESIGN.md](DESIGN.md) for detailed cost breakdowns with source links.

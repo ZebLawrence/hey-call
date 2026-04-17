@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a Python CLI tool that lets Mac initiate outbound AI phone calls via ElevenLabs + Twilio, then save the transcript, recording, and a Claude-generated summary to `workspace/calls/`.
+**Goal:** Build a Python CLI tool that lets Mac initiate outbound AI phone calls via ElevenLabs + Twilio, then save the transcript and recording to `workspace/calls/`. Summary generation happens in the Claude Code session (Mac analyzes the transcript in-context).
 
-**Architecture:** A single CLI script (`call.py`) orchestrates three focused modules: `config.py` loads env vars, `elevenlabs_client.py` wraps the ElevenLabs API (initiate → poll → fetch audio), and `report.py` formats the transcript and generates a summary via Claude. All artifacts land in a timestamped directory under `workspace/calls/`.
+**Architecture:** A single CLI script (`call.py`) orchestrates three focused modules: `config.py` loads env vars, `elevenlabs_client.py` wraps the ElevenLabs API (initiate → poll → fetch audio), and `report.py` formats the transcript and saves artifacts. All artifacts land in a timestamped directory under `workspace/calls/`. Mac (Claude Code) reads the transcript output and generates the summary in-session — no separate Anthropic API call.
 
-**Tech Stack:** Python 3.11+, `requests` (HTTP), `anthropic` SDK (summary generation), `python-dotenv` (env loading), `pytest` + `unittest.mock` (tests)
+**Tech Stack:** Python 3.11+, `requests` (HTTP), `python-dotenv` (env loading), `pytest` + `unittest.mock` (tests)
 
 ---
 
@@ -42,7 +42,6 @@
 Replace the contents of `workspace/phone-agent/requirements.txt` with:
 
 ```
-anthropic>=0.40.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
@@ -61,9 +60,6 @@ ELEVENLABS_AGENT_ID=your_agent_id_here
 
 # ID of the Twilio phone number registered in ElevenLabs (Settings → Phone Numbers)
 ELEVENLABS_PHONE_NUMBER_ID=your_phone_number_id_here
-
-# Anthropic API key — for generating call summaries
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ```
 
 - [ ] **Step 3: Create .gitignore**
@@ -135,7 +131,6 @@ def test_load_config_raises_when_all_missing():
         assert "ELEVENLABS_API_KEY" in msg
         assert "ELEVENLABS_AGENT_ID" in msg
         assert "ELEVENLABS_PHONE_NUMBER_ID" in msg
-        assert "ANTHROPIC_API_KEY" in msg
 
 
 def test_load_config_raises_when_one_missing():
@@ -143,23 +138,21 @@ def test_load_config_raises_when_one_missing():
     env = {
         "ELEVENLABS_API_KEY": "el_key",
         "ELEVENLABS_AGENT_ID": "agent_id",
-        "ELEVENLABS_PHONE_NUMBER_ID": "phone_id",
-        # ANTHROPIC_API_KEY intentionally omitted
+        # ELEVENLABS_PHONE_NUMBER_ID intentionally omitted
     }
     with patch.dict(os.environ, env, clear=True):
         from config import load_config
         with pytest.raises(ValueError) as exc:
             load_config()
-        assert "ANTHROPIC_API_KEY" in str(exc.value)
+        assert "ELEVENLABS_PHONE_NUMBER_ID" in str(exc.value)
 
 
 def test_load_config_returns_dict_when_all_present():
-    """All vars set → returns dict with all four keys."""
+    """All vars set → returns dict with all three keys."""
     env = {
         "ELEVENLABS_API_KEY": "el_key",
         "ELEVENLABS_AGENT_ID": "agent_id",
         "ELEVENLABS_PHONE_NUMBER_ID": "phone_id",
-        "ANTHROPIC_API_KEY": "ant_key",
     }
     with patch.dict(os.environ, env, clear=True):
         from config import load_config
@@ -167,7 +160,6 @@ def test_load_config_returns_dict_when_all_present():
     assert config["ELEVENLABS_API_KEY"] == "el_key"
     assert config["ELEVENLABS_AGENT_ID"] == "agent_id"
     assert config["ELEVENLABS_PHONE_NUMBER_ID"] == "phone_id"
-    assert config["ANTHROPIC_API_KEY"] == "ant_key"
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -192,7 +184,6 @@ REQUIRED_VARS = [
     "ELEVENLABS_API_KEY",
     "ELEVENLABS_AGENT_ID",
     "ELEVENLABS_PHONE_NUMBER_ID",
-    "ANTHROPIC_API_KEY",
 ]
 
 
@@ -277,9 +268,9 @@ def test_initiate_call_sends_correct_payload():
     assert body["agent_phone_number_id"] == "phone_id"
     assert body["to_number"] == "+13035551234"
     assert body["call_recording_enabled"] is True
-    override = body["conversation_initiation_client_data"]["conversation_config_override"]
-    assert override["prompt"]["prompt"] == "Your goal: find out the hours."
-    assert override["first_message"] == "Hi, this is Mac."
+    agent_override = body["conversation_initiation_client_data"]["conversation_config_override"]["agent"]
+    assert agent_override["prompt"]["prompt"] == "Your goal: find out the hours."
+    assert agent_override["first_message"] == "Hi, this is Mac."
 
 
 def test_initiate_call_raises_on_api_failure():
@@ -357,7 +348,7 @@ def test_poll_conversation_raises_on_timeout():
     # Simulate time advancing past the timeout
     import time as time_module
     start_time = 0.0
-    times = [start_time, start_time + 601]  # first call returns start, second exceeds timeout
+    times = [start_time, start_time + 901]  # first call returns start, second exceeds 900s timeout
 
     with patch("requests.get", return_value=in_progress):
         with patch("time.sleep"):
@@ -410,9 +401,12 @@ Create `workspace/phone-agent/elevenlabs_client.py`:
 import time
 import requests
 
+# Docs: https://elevenlabs.io/docs/api-reference/conversational-ai/get-conversation
 BASE_URL = "https://api.elevenlabs.io/v1"
-POLL_INTERVAL = 5   # seconds between status checks
-POLL_TIMEOUT = 600  # 10 minutes max
+POLL_INTERVAL_INITIAL = 5   # seconds between status checks for first 2 min
+POLL_INTERVAL_BACKOFF = 10  # seconds between checks after 2 min
+POLL_BACKOFF_AFTER = 120    # switch to backoff interval after this many seconds
+POLL_TIMEOUT = 900          # 15 minutes max
 
 
 def initiate_call(
@@ -433,6 +427,7 @@ def initiate_call(
         "xi-api-key": api_key,
         "Content-Type": "application/json",
     }
+    # Ref: https://elevenlabs.io/docs/api-reference/conversational-ai/twilio-outbound-call
     body = {
         "agent_id": agent_id,
         "agent_phone_number_id": phone_number_id,
@@ -440,8 +435,10 @@ def initiate_call(
         "call_recording_enabled": True,
         "conversation_initiation_client_data": {
             "conversation_config_override": {
-                "prompt": {"prompt": system_prompt},
-                "first_message": first_message,
+                "agent": {
+                    "prompt": {"prompt": system_prompt},
+                    "first_message": first_message,
+                }
             }
         },
     }
@@ -465,7 +462,8 @@ def poll_conversation(api_key: str, conversation_id: str) -> dict:
     start = time.time()
 
     while True:
-        if time.time() - start > POLL_TIMEOUT:
+        elapsed = time.time() - start
+        if elapsed > POLL_TIMEOUT:
             raise TimeoutError(
                 f"Call timed out after {POLL_TIMEOUT}s (conversation_id: {conversation_id})"
             )
@@ -480,15 +478,21 @@ def poll_conversation(api_key: str, conversation_id: str) -> dict:
         if status == "failed":
             raise RuntimeError(f"Call failed (conversation_id: {conversation_id})")
 
-        time.sleep(POLL_INTERVAL)
+        interval = POLL_INTERVAL_BACKOFF if elapsed > POLL_BACKOFF_AFTER else POLL_INTERVAL_INITIAL
+        time.sleep(interval)
 
 
-def fetch_audio(api_key: str, conversation_id: str) -> bytes | None:
+def fetch_audio(api_key: str, conversation_id: str, has_audio: bool = True) -> bytes | None:
     """Download the call recording.
 
-    Returns audio bytes if available, None if the recording is not present (404).
-    Raises for other HTTP errors.
+    Returns audio bytes if available, None if the recording is not present.
+    Checks `has_audio` flag from conversation response before making the request.
+    Raises for unexpected HTTP errors.
+
+    Docs: https://elevenlabs.io/docs/api-reference/conversational-ai/get-conversation-audio
     """
+    if not has_audio:
+        return None
     url = f"{BASE_URL}/convai/conversations/{conversation_id}/audio"
     headers = {"xi-api-key": api_key}
     resp = requests.get(url, headers=headers, timeout=60)
@@ -664,8 +668,10 @@ def format_transcript(transcript_array: list) -> str:
     """
     lines = []
     for turn in transcript_array:
+        message = turn.get("message")
+        if message is None:
+            continue  # EL API can return null message fields — skip them
         role = turn.get("role", "unknown").capitalize()
-        message = turn.get("message", "")
         lines.append(f"{role}: {message}")
     return "\n".join(lines)
 
@@ -702,21 +708,6 @@ def save_artifacts(
         (call_dir / "recording.mp3").write_bytes(audio_bytes)
 
     return call_dir, transcript_text
-
-
-def generate_summary(
-    anthropic_api_key: str,
-    goal: str,
-    to_number: str,
-    transcript_text: str,
-) -> str:
-    """Send transcript to Claude and return a structured summary markdown string."""
-    raise NotImplementedError("Implemented in Task 5")
-
-
-def write_summary(call_dir, summary_text: str) -> None:
-    """Write summary markdown to summary.md in call_dir."""
-    raise NotImplementedError("Implemented in Task 5")
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -740,146 +731,7 @@ tests/test_report.py::test_save_artifacts_skips_recording_when_none PASSED
 
 ---
 
-## Task 5: report.py — summary generation
-
-**Files:**
-- Modify: `workspace/phone-agent/tests/test_report.py` (add tests at end of file)
-- Modify: `workspace/phone-agent/report.py` (replace NotImplementedError stubs)
-
-- [ ] **Step 1: Add failing tests for generate_summary and write_summary**
-
-Append to the bottom of `workspace/phone-agent/tests/test_report.py`:
-
-```python
-# ── generate_summary ───────────────────────────────────────────────────────────
-
-def test_generate_summary_calls_claude_with_correct_structure():
-    """generate_summary sends goal, number, and transcript to Claude."""
-    mock_message = MagicMock()
-    mock_message.content = [MagicMock(text="## Call Outcome\nachieved")]
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_message
-
-    with patch("anthropic.Anthropic", return_value=mock_client):
-        from report import generate_summary
-        result = generate_summary(
-            anthropic_api_key="ant_key",
-            goal="find out the hours",
-            to_number="+13035551234",
-            transcript_text="Agent: Hi.\nUser: We open at 9.",
-        )
-
-    assert result == "## Call Outcome\nachieved"
-    call_kwargs = mock_client.messages.create.call_args[1]
-    assert call_kwargs["model"] == "claude-sonnet-4-6"
-    # Goal and transcript appear in the user message content
-    user_content = call_kwargs["messages"][0]["content"]
-    assert "find out the hours" in user_content
-    assert "Agent: Hi." in user_content
-
-
-def test_generate_summary_uses_sonnet_model():
-    """generate_summary always uses claude-sonnet-4-6."""
-    mock_message = MagicMock()
-    mock_message.content = [MagicMock(text="summary")]
-    mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_message
-
-    with patch("anthropic.Anthropic", return_value=mock_client):
-        from report import generate_summary
-        generate_summary("key", "goal", "+1", "Agent: Hi.")
-
-    call_kwargs = mock_client.messages.create.call_args[1]
-    assert call_kwargs["model"] == "claude-sonnet-4-6"
-
-
-# ── write_summary ──────────────────────────────────────────────────────────────
-
-def test_write_summary_creates_file(tmp_path):
-    """write_summary writes the summary text to summary.md."""
-    from report import write_summary
-    write_summary(tmp_path, "## Call Outcome\nachieved")
-    assert (tmp_path / "summary.md").read_text() == "## Call Outcome\nachieved"
-```
-
-- [ ] **Step 2: Run new tests to verify they fail**
-
-```bash
-cd workspace/phone-agent && python -m pytest tests/test_report.py::test_generate_summary_calls_claude_with_correct_structure tests/test_report.py::test_generate_summary_uses_sonnet_model tests/test_report.py::test_write_summary_creates_file -v
-```
-
-Expected: 3 failures — `NotImplementedError`
-
-- [ ] **Step 3: Replace NotImplementedError stubs in report.py**
-
-In `workspace/phone-agent/report.py`, add `import anthropic` at the top, then replace the two stub functions:
-
-```python
-import anthropic
-```
-
-Replace `generate_summary`:
-
-```python
-def generate_summary(
-    anthropic_api_key: str,
-    goal: str,
-    to_number: str,
-    transcript_text: str,
-) -> str:
-    """Send transcript to Claude and return a structured summary markdown string."""
-    client = anthropic.Anthropic(api_key=anthropic_api_key)
-
-    system = (
-        "You are Mac, an AI assistant. You just completed a phone call on behalf of "
-        "Zeb Lawrence. Analyze the call transcript and produce a structured report."
-    )
-    user = (
-        f"Call goal: {goal}\n"
-        f"Target number: {to_number}\n\n"
-        f"Transcript:\n{transcript_text}\n\n"
-        "Produce a structured report using exactly these sections:\n\n"
-        "## Call Outcome\n"
-        "[achieved / partially achieved / not achieved / no answer / voicemail]\n\n"
-        "## Key Facts Learned\n"
-        "[bullet list, or 'None']\n\n"
-        "## Follow-Up Actions\n"
-        "[bullet list, or 'None']\n\n"
-        "## Notable Moments\n"
-        "[anything surprising, useful, or worth flagging — or 'None']\n\n"
-        "## Raw Transcript Summary\n"
-        "[2-3 sentence narrative of how the call went]"
-    )
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
-    return message.content[0].text
-```
-
-Replace `write_summary`:
-
-```python
-def write_summary(call_dir, summary_text: str) -> None:
-    """Write summary markdown to summary.md in call_dir."""
-    Path(call_dir) / "summary.md"
-    (Path(call_dir) / "summary.md").write_text(summary_text, encoding="utf-8")
-```
-
-- [ ] **Step 4: Run all report tests**
-
-```bash
-cd workspace/phone-agent && python -m pytest tests/test_report.py -v
-```
-
-Expected: 11 passed
-
----
-
-## Task 6: call.py — wire everything together
+## Task 5: call.py — wire everything together
 
 **Files:**
 - Create: `workspace/phone-agent/call.py`
@@ -901,6 +753,7 @@ Usage:
 Example:
     python call.py "+13035551234" "find out if the business is open on weekends"
 """
+import re
 import sys
 from pathlib import Path
 
@@ -909,10 +762,22 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config
 from elevenlabs_client import initiate_call, poll_conversation, fetch_audio
-from report import save_artifacts, generate_summary, write_summary
+from report import save_artifacts
 
 CALLS_DIR = Path(__file__).parent.parent / "calls"
 PROMPTS_DIR = Path(__file__).parent / "prompts"
+
+# E.164: + followed by 10-15 digits
+E164_PATTERN = re.compile(r"^\+\d{10,15}$")
+
+
+def validate_phone_number(number: str) -> None:
+    """Validate phone number is E.164 format. Raises ValueError if not."""
+    if not E164_PATTERN.match(number):
+        raise ValueError(
+            f"Invalid phone number: {number}\n"
+            f"Expected E.164 format: +<country code><number> (e.g. +13035551234)"
+        )
 
 
 def build_system_prompt(goal: str) -> str:
@@ -929,6 +794,12 @@ def main():
 
     to_number = sys.argv[1]
     goal = sys.argv[2]
+
+    try:
+        validate_phone_number(to_number)
+    except ValueError as e:
+        print(f"Validation error: {e}")
+        sys.exit(1)
 
     print(f"\nInitiating call to {to_number}")
     print(f"Goal: {goal}\n")
@@ -958,7 +829,8 @@ def main():
         conversation_data = poll_conversation(config["ELEVENLABS_API_KEY"], conversation_id)
         print("Call completed. Fetching recording...")
 
-        audio_bytes = fetch_audio(config["ELEVENLABS_API_KEY"], conversation_id)
+        has_audio = conversation_data.get("has_audio", False)
+        audio_bytes = fetch_audio(config["ELEVENLABS_API_KEY"], conversation_id, has_audio=has_audio)
 
         call_dir, transcript_text = save_artifacts(
             calls_dir=CALLS_DIR,
@@ -968,29 +840,24 @@ def main():
             audio_bytes=audio_bytes,
         )
 
-        print(f"Artifacts saved to {call_dir}")
-        print("Generating summary...\n")
-
-        summary = generate_summary(
-            anthropic_api_key=config["ANTHROPIC_API_KEY"],
-            goal=goal,
-            to_number=to_number,
-            transcript_text=transcript_text,
-        )
-
-        write_summary(call_dir, summary)
-
         print("=" * 60)
-        print("CALL SUMMARY")
+        print(f"CALL COMPLETE — {to_number}")
+        print(f"Goal: {goal}")
         print("=" * 60)
-        print(summary)
-        print("=" * 60)
-        print(f"\nArtifacts:")
-        print(f"  Transcript: {call_dir}/transcript.txt")
-        print(f"  Full JSON:  {call_dir}/transcript.json")
+        print()
+        if transcript_text:
+            print("TRANSCRIPT:")
+            print("-" * 40)
+            print(transcript_text)
+            print("-" * 40)
+        else:
+            print("(No transcript — call may not have connected)")
+        print()
+        print(f"Artifacts saved to {call_dir}/")
+        print(f"  transcript.txt  — formatted turn-by-turn")
+        print(f"  transcript.json — raw ElevenLabs response")
         if audio_bytes:
-            print(f"  Recording:  {call_dir}/recording.mp3")
-        print(f"  Summary:    {call_dir}/summary.md")
+            print(f"  recording.mp3   — full call audio")
 
     except TimeoutError as e:
         print(f"\nTimeout: {e}")
@@ -1041,7 +908,7 @@ Copy .env.example to .env and fill in your API keys.
 
 ---
 
-## Task 7: Account Setup and Live Test
+## Task 6: Account Setup and Live Test
 
 This task is manual — no code to write. Follow the setup checklist from DESIGN.md, then make a real test call.
 
@@ -1085,7 +952,6 @@ Edit `workspace/phone-agent/.env` and fill in:
 ELEVENLABS_API_KEY=<your key>
 ELEVENLABS_AGENT_ID=<your agent id>
 ELEVENLABS_PHONE_NUMBER_ID=<your EL phone number id>
-ANTHROPIC_API_KEY=<your anthropic key>
 ```
 
 - [ ] **Step 6: Make a test call to your own phone**
@@ -1098,8 +964,9 @@ Expected flow:
 1. Your phone rings from an unknown number
 2. The agent greets you and asks what time it is
 3. You respond, agent thanks you and ends the call
-4. Script prints the summary
-5. Check `workspace/calls/` — a new directory should exist with `transcript.json`, `transcript.txt`, `recording.mp3`, `summary.md`
+4. Script prints the transcript to stdout
+5. Mac (Claude Code) reads the output and generates a summary in-session
+6. Check `workspace/calls/` — a new directory should exist with `transcript.json`, `transcript.txt`, `recording.mp3`
 
 ---
 
@@ -1109,31 +976,32 @@ Expected flow:
 
 | Spec requirement | Covered by |
 |-----------------|-----------|
-| Triggered from Claude Code session via `python call.py` | Task 6 |
-| ElevenLabs Conversational AI + Twilio | Tasks 3, 7 |
-| Per-call system prompt override via `conversation_initiation_client_data` | Task 3 (initiate_call) |
-| Poll until done with 10-min timeout | Task 3 (poll_conversation) |
+| Triggered from Claude Code session via `python call.py` | Task 5 |
+| ElevenLabs Conversational AI + Twilio | Tasks 3, 6 |
+| Per-call system prompt override via `conversation_initiation_client_data.conversation_config_override.agent` | Task 3 (initiate_call) |
+| Poll with backoff + 15-min timeout | Task 3 (poll_conversation) |
 | `transcript.json` saved | Task 4 (save_artifacts) |
 | `transcript.txt` saved | Task 4 (save_artifacts + format_transcript) |
-| `recording.mp3` saved | Task 4 (save_artifacts) |
-| `summary.md` generated via Claude Sonnet | Task 5 |
-| Summary printed to stdout | Task 6 (call.py) |
+| `recording.mp3` saved (when available) | Task 4 (save_artifacts) + `has_audio` check |
+| Summary generated by Mac in Claude Code session | Mac reads call.py stdout — no separate API call |
+| Transcript printed to stdout | Task 5 (call.py) |
+| Phone number validation (E.164) | Task 5 (call.py) |
 | Missing env var → clear error | Task 2 (config.py) |
-| No answer / voicemail → handled | EL agent handles; poll returns `done` with empty transcript; Task 5 summary flags it |
+| Null transcript messages → filtered | Task 4 (format_transcript) |
+| No answer / voicemail → handled | EL agent handles via system prompt; transcript saved |
 | Call failed status → RuntimeError | Task 3 (poll_conversation) |
 | Timeout → TimeoutError | Task 3 (poll_conversation) |
 | `call_recording_enabled: true` | Task 3 (initiate_call body) |
-| `.env.example` template | Task 1 |
+| `.env.example` template (3 vars, no Anthropic key) | Task 1 |
 | `workspace/calls/` directory | Task 1 |
 | `prompts/agent_system.txt` template | Already exists (created during design) |
 
 All spec requirements covered. No gaps found.
 
-**Placeholder scan:** No TBD, TODO, or incomplete sections. All code blocks are complete. All function signatures are consistent across tasks (`format_transcript`, `save_artifacts`, `generate_summary`, `write_summary` defined in Task 4/5, used in Task 6).
+**Placeholder scan:** No TBD, TODO, or incomplete sections. All code blocks are complete. All function signatures are consistent across tasks (`format_transcript`, `save_artifacts` defined in Task 4, used in Task 5).
 
 **Type consistency check:**
-- `save_artifacts` returns `(Path, str)` in Task 4 — destructured as `call_dir, transcript_text` in Task 6. ✓
-- `generate_summary` takes `(str, str, str, str)` — called with same signature in Task 6. ✓
-- `initiate_call` returns `str` (conversation_id) — assigned in Task 6. ✓
+- `save_artifacts` returns `(Path, str)` in Task 4 — destructured as `call_dir, transcript_text` in Task 5. ✓
+- `initiate_call` returns `str` (conversation_id) — assigned in Task 5. ✓
 - `poll_conversation` returns `dict` — passed to `save_artifacts` as `conversation_data`. ✓
 - `fetch_audio` returns `bytes | None` — passed to `save_artifacts` as `audio_bytes`. ✓

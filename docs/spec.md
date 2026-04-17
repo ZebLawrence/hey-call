@@ -1,5 +1,7 @@
 # AI Phone Caller — Design Spec
 
+> **Note:** This is a snapshot. The authoritative design spec is [`../DESIGN.md`](../DESIGN.md).
+
 **Date:** 2026-04-16  
 **Status:** Draft — pending implementation  
 **Strategy:** ElevenLabs Conversational AI + Twilio  
@@ -107,8 +109,9 @@ workspace/calls/
    │   → call_recording_enabled: true
    │   → conversation_initiation_client_data:
    │       conversation_config_override:
-   │         prompt: { prompt: <system prompt with goal> }
-   │         first_message: "Hi, this is Mac calling on behalf of Zeb..."
+   │         agent:
+   │           prompt: { prompt: <system prompt with goal> }
+   │           first_message: "Hi, this is Mac calling on behalf of Zeb..."
    │   ← { success, conversation_id, callSid }
    │
 4. Poll GET /v1/convai/conversations/{id} every 5s
@@ -130,7 +133,7 @@ workspace/calls/
 
 ## ElevenLabs Agent Configuration
 
-One persistent agent is pre-configured in the ElevenLabs dashboard. Per-call customization happens via `conversation_initiation_client_data.conversation_config_override` in the API call (so we don't create a new agent per call).
+One persistent agent is pre-configured in the ElevenLabs dashboard. Per-call customization happens via `conversation_initiation_client_data.conversation_config_override.agent` in the API call (so we don't create a new agent per call).
 
 **Agent settings:**
 
@@ -185,10 +188,9 @@ The summary is printed to stdout and saved to `summary.md`.
 ELEVENLABS_API_KEY=...          # ElevenLabs account API key
 ELEVENLABS_AGENT_ID=...         # ID of the pre-configured EL agent
 ELEVENLABS_PHONE_NUMBER_ID=...  # ID of the Twilio DID registered in EL
-ANTHROPIC_API_KEY=...           # For summary generation
 ```
 
-Twilio credentials are not needed in the Python code — they're configured inside ElevenLabs when you import the phone number.
+Twilio credentials are not needed in the Python code — they're configured inside ElevenLabs when you import the phone number. No Anthropic API key needed — summary generation happens in the Claude Code session.
 
 ---
 
@@ -218,16 +220,18 @@ Twilio credentials are not needed in the Python code — they're configured insi
 
 ## Cost Model
 
+> See [`../DESIGN.md`](../DESIGN.md) for the authoritative cost model with source links.
+
 | Component | Rate | 5-min call |
 |-----------|------|-----------|
 | ElevenLabs Conversational AI | ~$0.08/min | $0.40 |
-| Twilio outbound (US) | ~$0.013/min | $0.065 |
-| Claude summary (claude-sonnet-4-6) | ~$0.003/call | $0.003 |
+| Twilio outbound (US) | ~$0.014/min | $0.07 |
+| Claude summary (claude-sonnet-4-6) | ~$0.01/call | $0.01 |
 | Twilio DID number | $1.15/month | — |
-| **Total per call** | | **~$0.47** |
+| **Total per call** | | **~$0.48** |
 
-At 10 calls/day: ~$4.70/day, ~$141/month + $1.15 DID = **~$142/month**.  
-At 1-2 calls/day (expected): **~$15-30/month**.
+At 10 calls/day: ~$4.80/day, ~$144/month + $1.15 DID = **~$145/month**.  
+At 1-2 calls/day (expected): **~$16-30/month**.
 
 ---
 
