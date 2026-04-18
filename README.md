@@ -50,6 +50,16 @@ cp .env.example .env
 python call.py "+13035551234" "find out if the owner is open to selling the business"
 ```
 
+You can also pass an optional context string as a third argument — useful for grounding the agent in details from a prior touchpoint:
+
+```bash
+python call.py "+13035551234" \
+  "ask if the laundromat is for sale" \
+  "Zeb toured it last Tuesday. The owner is Maria; she mentioned wanting to retire in the next year."
+```
+
+Both `{{GOAL}}` and `{{CONTEXT}}` are substituted into `prompts/agent_system.txt` before the call.
+
 ## Output
 
 Each call saves to `calls/YYYY-MM-DD_HH-MM_<last4>/`:
